@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Satisfacción Estudiantil · UPDS Cochabamba · I-2026</title>
- <script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   :root{
     --navy:#14213D;
@@ -128,6 +129,33 @@
   }
   #resetbtn:hover{ border-color:var(--brick); }
 
+  /* excel import controls */
+  #excel-tools{
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+    margin-bottom:12px; padding:10px 12px;
+    background:#fff; border:1px solid var(--line); border-radius:10px;
+  }
+  #excel-tools .excel-label{
+    display:inline-flex; align-items:center; gap:6px; cursor:pointer;
+    padding:7px 14px; border-radius:20px;
+    background:var(--navy); color:#fff; font-size:12.5px; font-weight:600;
+    border:1px solid var(--navy); transition:background .15s ease;
+  }
+  #excel-tools .excel-label:hover{ background:var(--navy3); }
+  #excel-file-input{ display:none; }
+  #btn-actualizar-dashboard{
+    all:unset; cursor:pointer;
+    display:inline-flex; align-items:center; gap:6px;
+    padding:7px 14px; border-radius:20px;
+    background:var(--gold-soft); color:#5A4315; font-size:12.5px; font-weight:600;
+    border:1px solid var(--gold);
+  }
+  #btn-actualizar-dashboard:hover{ background:var(--gold); color:#2A2007; }
+  .excel-file-name{ font-size:11.5px; color:var(--ink-soft); max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #excel-status{ font-size:11.5px; color:var(--ink-soft); }
+  #excel-status.ok{ color:var(--teal); font-weight:600; }
+  #excel-status.err{ color:var(--brick); font-weight:600; }
+
   /* content */
   #content{ padding:22px 28px 60px 28px; }
   .tabpanel{ display:none; }
@@ -217,7 +245,7 @@
     <nav id="tabnav"></nav>
     <div class="sidebar-foot">
       Fuente: formulario de encuesta a estudiantes.<br>
-      744 respuestas registradas.
+      <span id="sidebar-count">744</span> respuestas registradas.
     </div>
   </aside>
 
@@ -229,6 +257,12 @@
           <p class="desc" id="tab-desc">Vista general del nivel de satisfacción, lealtad y riesgo de abandono de los estudiantes.</p>
         </div>
         <div id="resultcount"></div>
+      </div>
+      <div id="excel-tools">
+        <label for="excel-file-input" class="excel-label">📊 Cargar Excel (.xlsx)</label>
+        <input type="file" id="excel-file-input" accept=".xlsx,.xls">
+        <button id="btn-actualizar-dashboard" type="button">🔄 Actualizar Dashboard</button>
+        <span id="excel-status">Carga un archivo con el formato de la plantilla para reemplazar los datos automáticamente.</span>
       </div>
       <div id="filterbar"></div>
     </div>
@@ -246,7 +280,7 @@
   const DATA = JSON.parse(document.getElementById('data-blob').textContent);
   const ROWS = DATA.rows;
   const META = DATA.meta;
-  const TOTAL = ROWS.length;
+  let TOTAL = ROWS.length;
 
   const COLORS = {
     navy:'#14213D', navy3:'#33477A', gold:'#C89B3C', teal:'#2F7A6F',
@@ -969,11 +1003,176 @@
     `;
   }
 
+  /* ---------------- Excel import ---------------- */
+  const CONT_LABELS = ['Nada probable','Poco probable','Probable','Muy probable'];
+
+  function normStr(s){ return (s===null||s===undefined) ? '' : String(s).trim().toLowerCase(); }
+
+  function findIdx(list, value){
+    const v = normStr(value);
+    if(!v) return -1;
+    for(let i=0;i<list.length;i++){ if(normStr(list[i])===v) return i; }
+    return -1;
+  }
+
+  function findSemestreIdx(value){
+    let idx = findIdx(META.semestres, value);
+    if(idx>=0) return idx;
+    const s = normStr(value);
+    const m = s.match(/^(\d{1,2})/);
+    if(m){ const n=parseInt(m[1],10); if(n>=1 && n<=META.semestres.length) return n-1; }
+    return -1;
+  }
+
+  function toNum(v, def){
+    if(v===null||v===undefined||v==='') return def;
+    const n = Number(v);
+    return isNaN(n) ? def : n;
+  }
+
+  function clampInt(v, lo, hi, def){
+    const n = toNum(v, def);
+    return Math.max(lo, Math.min(hi, Math.round(n)));
+  }
+
+  function parseSiNo(v){
+    const s = normStr(v);
+    return (s==='si'||s==='sí'||s==='yes'||s==='1'||s==='true'||s==='x') ? 1 : 0;
+  }
+
+  function parseMultiIdx(v, list){
+    if(v===null||v===undefined||v==='') return [];
+    const parts = String(v).split(/[;,/]/).map(p=>p.trim()).filter(Boolean);
+    const out = [];
+    parts.forEach(p=>{ const idx=findIdx(list,p); if(idx>=0 && out.indexOf(idx)===-1) out.push(idx); });
+    return out;
+  }
+
+  function excelDateToStr(v){
+    if(v===null||v===undefined||v==='') return new Date().toISOString().slice(0,10);
+    if(v instanceof Date && !isNaN(v.getTime())) return v.toISOString().slice(0,10);
+    const d2 = new Date(v);
+    if(!isNaN(d2.getTime())) return d2.toISOString().slice(0,10);
+    return String(v).trim();
+  }
+
+  function excelRowToDataRow(obj){
+    const f = findIdx(META.facultades, obj['Facultad']);
+    const c = findIdx(META.carreras, obj['Carrera']);
+    const m = findIdx(META.modalidades, obj['Modalidad']);
+    const s = findSemestreIdx(obj['Semestre']);
+    const x = findIdx(META.sexos, obj['Sexo']);
+    if(f<0 || c<0 || m<0 || s<0 || x<0) return null; // fila incompleta o con valores no reconocidos: se omite
+
+    const sv = META.servicios.map(lbl => clampInt(obj['Servicio - '+lbl], 0, 5, 0));
+    const iff = META.infra.map(lbl => clampInt(obj['Infraestructura - '+lbl], 0, 5, 0));
+    const en = META.ensen.map(lbl => clampInt(obj['Enseñanza - '+lbl], 0, 5, 0));
+    const tec = clampInt(obj['Uso de Tecnología en el Aula (1-5)'], 0, 5, 0);
+    const red = findIdx(META.red, obj['Canal preferido para informarse']);
+    const asp = findIdx(META.aspecto, obj['Motivo principal de insatisfacción']);
+    const mejRaw = obj['Aspecto a mejorar en la enseñanza'];
+    const mej = (mejRaw===null||mejRaw===undefined||String(mejRaw).trim()==='') ? -1 : findIdx(META.mejora, mejRaw);
+    const cc = parseSiNo(obj['¿Consideró cambiar de carrera? (Sí/No)']);
+    const rc = parseMultiIdx(obj['Motivos para cambiar de carrera'], META.razCarrera);
+    const cu = parseSiNo(obj['¿Consideró dejar la universidad? (Sí/No)']);
+    const ru = parseMultiIdx(obj['Motivos para dejar la universidad'], META.razUni);
+    const contIdx = findIdx(CONT_LABELS, obj['Probabilidad de continuar el próximo semestre']);
+    const cont = contIdx>=0 ? contIdx+1 : 0;
+    const nps = clampInt(obj['NPS - Probabilidad de recomendar (0-10)'], 0, 10, 0);
+    const sat = clampInt(obj['Satisfacción general (0-10)'], 0, 10, 0);
+    const ts = excelDateToStr(obj['Fecha']);
+
+    return {f,c,m,s,x, sv:sv, if:iff, en:en, tec:tec, red:red, asp:asp, mej:mej, cc:cc, rc:rc, cu:cu, ru:ru, cont:cont, nps:nps, sat:sat, ts:ts};
+  }
+
+  function setExcelStatus(msg, type){
+    const el = document.getElementById('excel-status');
+    if(!el) return;
+    el.textContent = msg;
+    el.className = type ? type : '';
+  }
+
+  function applyNewRows(newRows){
+    ROWS.length = 0;
+    Array.prototype.push.apply(ROWS, newRows);
+    TOTAL = ROWS.length;
+    const sc = document.getElementById('sidebar-count');
+    if(sc) sc.textContent = TOTAL;
+    FILTER_DIMS.forEach(d=>FILTERS[d.key].clear());
+    refreshFilterUI();
+    onFiltersChanged();
+  }
+
+  function processWorkbook(workbook, fileLabel){
+    try{
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const json = XLSX.utils.sheet_to_json(sheet, {defval:'', raw:true});
+      if(!json.length){
+        setExcelStatus('⚠️ El archivo no contiene filas de datos.', 'err');
+        return;
+      }
+      const parsed = [];
+      let skipped = 0;
+      json.forEach(row=>{
+        const r = excelRowToDataRow(row);
+        if(r) parsed.push(r); else skipped++;
+      });
+      if(!parsed.length){
+        setExcelStatus('⚠️ No se pudo interpretar ninguna fila. Verifica que las columnas Facultad, Carrera, Modalidad, Semestre y Sexo coincidan con la plantilla.', 'err');
+        return;
+      }
+      applyNewRows(parsed);
+      let msg = '✅ '+parsed.length+' respuestas cargadas desde "'+fileLabel+'"';
+      if(skipped>0) msg += ' ('+skipped+' fila(s) omitida(s) por datos incompletos)';
+      setExcelStatus(msg, 'ok');
+    }catch(err){
+      console.error(err);
+      setExcelStatus('❌ No se pudo leer el archivo. Asegúrate de que sea un .xlsx válido con el formato de la plantilla.', 'err');
+    }
+  }
+
+  function readExcelFile(file){
+    if(!file) return;
+    setExcelStatus('⏳ Procesando "'+file.name+'"…', '');
+    const reader = new FileReader();
+    reader.onload = function(e){
+      try{
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, {type:'array', cellDates:true});
+        processWorkbook(workbook, file.name);
+      }catch(err){
+        console.error(err);
+        setExcelStatus('❌ No se pudo leer el archivo. Asegúrate de que sea un .xlsx válido.', 'err');
+      }
+    };
+    reader.onerror = function(){ setExcelStatus('❌ Error al leer el archivo.', 'err'); };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function setupExcelControls(){
+    const fileInput = document.getElementById('excel-file-input');
+    const updateBtn = document.getElementById('btn-actualizar-dashboard');
+    if(!fileInput || !updateBtn) return;
+    // Carga automática: al seleccionar un archivo, el dashboard se actualiza de inmediato.
+    fileInput.addEventListener('change', function(){
+      const file = fileInput.files && fileInput.files[0];
+      if(file) readExcelFile(file);
+    });
+    // Botón manual: permite forzar la actualización con el archivo ya seleccionado.
+    updateBtn.addEventListener('click', function(){
+      const file = fileInput.files && fileInput.files[0];
+      if(file){ readExcelFile(file); }
+      else { setExcelStatus('Selecciona primero un archivo Excel (.xlsx).', 'err'); }
+    });
+  }
+
   /* ---------------- init ---------------- */
   function init(){
     buildNav();
     buildFilterbar();
     buildContent();
+    setupExcelControls();
     document.getElementById('resultcount').innerHTML = '<b>'+TOTAL+'</b> de '+TOTAL+' respuestas seleccionadas';
     switchTab('resumen');
   }
